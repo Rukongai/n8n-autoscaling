@@ -1,0 +1,169 @@
+name: Sync Upstream And Build Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: "Sync from upstream before building"
+        required: false
+        type: boolean
+        default: true
+      push_images:
+        description: "Build and push images to GHCR"
+        required: false
+        type: boolean
+        default: true
+      upstream_repo:
+        description: "Upstream repo in owner/name format (overrides repo variable)"
+        required: false
+        type: string
+      upstream_branch:
+        description: "Upstream branch to sync from (default: main)"
+        required: false
+        type: string
+  schedule:
+    - cron: "15 4 * * 1"
+
+concurrency:
+  group: sync-and-build-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  sync-upstream:
+    name: Sync Upstream
+    if: ${{ github.event_name == 'schedule' || inputs.sync_upstream }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve upstream settings
+        id: upstream
+        env:
+          INPUT_REPO: ${{ inputs.upstream_repo }}
+          INPUT_BRANCH: ${{ inputs.upstream_branch }}
+          VAR_REPO: ${{ vars.UPSTREAM_REPO }}
+          VAR_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+        run: |
+          REPO="${INPUT_REPO:-$VAR_REPO}"
+          BRANCH="${INPUT_BRANCH:-$VAR_BRANCH}"
+          BRANCH="${BRANCH:-main}"
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Sync branch from upstream
+        env:
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${UPSTREAM_REPO}" ]; then
+            echo "UPSTREAM_REPO is not set. Skipping sync."
+            exit 0
+          fi
+
+          case "${UPSTREAM_REPO}" in
+            */*) ;;
+            *)
+              echo "::error::UPSTREAM_REPO must be owner/repo. Got: ${UPSTREAM_REPO}"
+              exit 1
+              ;;
+          esac
+
+          BEFORE_SHA="$(git rev-parse HEAD)"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+          git checkout "${TARGET_BRANCH}"
+
+          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
+            echo "Already up to date with upstream/${UPSTREAM_BRANCH}"
+            exit 0
+          fi
+
+          if ! git merge --ff-only "upstream/${UPSTREAM_BRANCH}"; then
+            echo "Fast-forward merge not possible; trying merge commit."
+            git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+          fi
+
+          AFTER_SHA="$(git rev-parse HEAD)"
+          if [ "${BEFORE_SHA}" = "${AFTER_SHA}" ]; then
+            echo "No upstream changes to push."
+            exit 0
+          fi
+
+          git push origin "HEAD:${TARGET_BRANCH}"
+
+  build-and-push:
+    name: Build And Push Images
+    needs: [sync-upstream]
+    if: ${{ (needs['sync-upstream'].result == 'success' || needs['sync-upstream'].result == 'skipped') && (github.event_name != 'workflow_dispatch' || inputs.push_images) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: n8n
+            dockerfile: Dockerfile
+            context: .
+          - image: n8n-runner
+            dockerfile: Dockerfile.runner
+            context: .
+          - image: n8n-autoscaler
+            dockerfile: autoscaler/Dockerfile
+            context: .
+          - image: n8n-backup
+            dockerfile: backup/Dockerfile
+            context: .
+          - image: n8n-monitor
+            dockerfile: monitor/monitor.Dockerfile
+            context: .
+    steps:
+      - name: Checkout latest branch tip
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image SHA
+        id: image_sha
+        run: echo "value=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          platforms: ${{ vars.DOCKER_PLATFORMS || 'linux/amd64' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:sha-${{ steps.image_sha.outputs.value }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
