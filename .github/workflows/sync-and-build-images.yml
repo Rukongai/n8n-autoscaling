@@ -35,6 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -57,10 +58,14 @@ jobs:
           REPO="${INPUT_REPO:-$VAR_REPO}"
           BRANCH="${INPUT_BRANCH:-$VAR_BRANCH}"
           BRANCH="${BRANCH:-main}"
+          SYNC_BRANCH="automation/upstream-sync-${BRANCH}"
           echo "repo=$REPO" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "sync_branch=$SYNC_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Sync branch from upstream
+        id: sync
+        continue-on-error: true
         env:
           UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
           UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
@@ -93,7 +98,14 @@ jobs:
 
           if ! git merge --ff-only "upstream/${UPSTREAM_BRANCH}"; then
             echo "Fast-forward merge not possible; trying merge commit."
-            git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+            if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+              echo "Merge conflict detected. Preparing conflict PR branch."
+              git merge --abort || true
+              SYNC_BRANCH="${{ steps.upstream.outputs.sync_branch }}"
+              git checkout -B "${SYNC_BRANCH}" "upstream/${UPSTREAM_BRANCH}"
+              git push -u origin "${SYNC_BRANCH}" --force
+              exit 1
+            fi
           fi
 
           AFTER_SHA="$(git rev-parse HEAD)"
@@ -103,6 +115,58 @@ jobs:
           fi
 
           git push origin "HEAD:${TARGET_BRANCH}"
+
+      - name: Create or update conflict PR
+        if: ${{ steps.sync.outcome == 'failure' && steps.upstream.outputs.sync_branch != '' }}
+        uses: actions/github-script@v7
+        env:
+          SYNC_BRANCH: ${{ steps.upstream.outputs.sync_branch }}
+          TARGET_BRANCH: ${{ github.ref_name }}
+          UPSTREAM_REPO: ${{ steps.upstream.outputs.repo }}
+          UPSTREAM_BRANCH: ${{ steps.upstream.outputs.branch }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const head = `${owner}:${process.env.SYNC_BRANCH}`;
+            const base = process.env.TARGET_BRANCH;
+
+            const existing = await github.rest.pulls.list({
+              owner,
+              repo,
+              state: 'open',
+              head,
+              base
+            });
+
+            if (existing.data.length > 0) {
+              core.info(`Conflict PR already open: #${existing.data[0].number}`);
+              return;
+            }
+
+            const pr = await github.rest.pulls.create({
+              owner,
+              repo,
+              title: `Sync upstream ${process.env.UPSTREAM_REPO}@${process.env.UPSTREAM_BRANCH}`,
+              head: process.env.SYNC_BRANCH,
+              base,
+              body: [
+                'Automated upstream sync hit a merge conflict.',
+                '',
+                `Upstream: \`${process.env.UPSTREAM_REPO}\``,
+                `Branch: \`${process.env.UPSTREAM_BRANCH}\``,
+                '',
+                'This PR was opened so conflicts can be resolved safely.'
+              ].join('\n')
+            });
+
+            core.info(`Created conflict PR: #${pr.data.number}`);
+
+      - name: Fail on sync conflict
+        if: ${{ steps.sync.outcome == 'failure' }}
+        run: |
+          echo "::error::Upstream sync failed due to merge conflicts. Conflict PR has been opened/updated."
+          exit 1
 
   build-and-push:
     name: Build And Push Images
