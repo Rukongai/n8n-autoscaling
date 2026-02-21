@@ -18,9 +18,7 @@ x-logging: &default-logging
     max-file: ${LOG_MAX_FILE:-3}
 
 x-n8n: &service-n8n
-  build:
-    context: .
-    dockerfile: Dockerfile
+  image: ${N8N_IMAGE:-ghcr.io/rukongai/n8n:latest}
   user: root:root
   restart: unless-stopped
   logging: *default-logging
@@ -76,9 +74,7 @@ x-n8n: &service-n8n
 
 # Task runner base configuration for n8n 2.0
 x-task-runner: &service-task-runner
-  build:
-    context: .
-    dockerfile: Dockerfile.runner
+  image: ${N8N_RUNNER_IMAGE:-ghcr.io/rukongai/n8n-runner:latest}
   restart: unless-stopped
   logging: *default-logging
   networks:
@@ -122,7 +118,7 @@ services:
       - n8n-network
 
   postgres:
-    image: pgvector/pgvector:pg17
+    image: ${POSTGRES_IMAGE:-ghcr.io/rukongai/n8n-postgres:latest}
     restart: unless-stopped
     logging: *default-logging
     ports:
@@ -141,8 +137,6 @@ services:
 #      - POSTGRES_HOST=0.0.0.0 # Listen on all interfaces inside container
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init-pgvector.sql/init.sql:/docker-entrypoint-initdb.d/01-init-pgvector.sql
-      - ./init-postgres.sh:/docker-entrypoint-initdb.d/02-init-postgres.sh
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_ADMIN_USER:-postgres}"]
       interval: 5s
@@ -246,9 +240,7 @@ services:
 
   n8n-backup:
     profiles: [backup]
-    build:
-      context: .
-      dockerfile: backup/Dockerfile
+    image: ${N8N_BACKUP_IMAGE:-ghcr.io/rukongai/n8n-backup:latest}
     restart: unless-stopped
     logging: *default-logging
     volumes:
@@ -287,9 +279,7 @@ services:
       - n8n-network
 
   redis-monitor:
-    build:
-      context: .
-      dockerfile: monitor/monitor.Dockerfile
+    image: ${N8N_MONITOR_IMAGE:-ghcr.io/rukongai/n8n-monitor:latest}
     restart: unless-stopped
     logging: *default-logging
     depends_on:
@@ -308,16 +298,7 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
 
   n8n-autoscaler:
-    build:
-      context: .
-      dockerfile: autoscaler/Dockerfile
-      args:
-        - REDIS_HOST=${REDIS_HOST}
-        - REDIS_PORT=${REDIS_PORT}
-        - QUEUE_NAME_PREFIX=${QUEUE_NAME_PREFIX}
-        - QUEUE_NAME=${QUEUE_NAME}
-        - N8N_WORKER_SERVICE_NAME=${N8N_WORKER_SERVICE_NAME}
-        - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
+    image: ${N8N_AUTOSCALER_IMAGE:-ghcr.io/rukongai/n8n-autoscaler:latest}
     restart: unless-stopped
     logging: *default-logging
     environment:

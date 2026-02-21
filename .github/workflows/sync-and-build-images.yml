@@ -131,6 +131,9 @@ jobs:
           - image: n8n-monitor
             dockerfile: monitor/monitor.Dockerfile
             context: .
+          - image: n8n-postgres
+            dockerfile: postgres/Dockerfile
+            context: .
     steps:
       - name: Checkout latest branch tip
         uses: actions/checkout@v4
